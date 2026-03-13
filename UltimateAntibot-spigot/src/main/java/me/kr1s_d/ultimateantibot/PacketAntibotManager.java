@@ -1,19 +1,19 @@
 package me.kr1s_d.ultimateantibot;
 
 import java.net.InetSocketAddress;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 
-import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import io.papermc.paper.threadedregions.scheduler.AsyncScheduler;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import me.kr1s_d.ultimateantibot.common.utils.BoundedRingBuffer;
 import me.kr1s_d.ultimateantibot.utils.BotFingerprintAnalyzer;
 
@@ -40,13 +40,23 @@ public class PacketAntibotManager {
     private static final long KEEPALIVE_SEND_TICKS = 40L;
     private static final long VERIFICATION_SWEEP_TICKS = 600L;
 
+    // Folia 调度器
+    private final AsyncScheduler asyncScheduler;
+
     public PacketAntibotManager(JavaPlugin plugin, ConnectionController controller) {
         this.plugin = plugin;
         this.controller = controller;
+        this.asyncScheduler = plugin.getServer().getAsyncScheduler();
 
-        Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::cleanupAndEvaluate, CLEANUP_TIMER_TICKS, CLEANUP_TIMER_TICKS);
-        Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::sendKeepalivesToPending, 20L, KEEPALIVE_SEND_TICKS);
-        Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::finalVerificationSweep, VERIFICATION_SWEEP_TICKS, VERIFICATION_SWEEP_TICKS);
+        // F
+        asyncScheduler.runAtFixedRate(plugin, task -> cleanupAndEvaluate(),
+                CLEANUP_TIMER_TICKS * 50, CLEANUP_TIMER_TICKS * 50, TimeUnit.MILLISECONDS);
+
+        asyncScheduler.runAtFixedRate(plugin, task -> sendKeepalivesToPending(),
+                20 * 50, KEEPALIVE_SEND_TICKS * 50, TimeUnit.MILLISECONDS);
+
+        asyncScheduler.runAtFixedRate(plugin, task -> finalVerificationSweep(),
+                VERIFICATION_SWEEP_TICKS * 50, VERIFICATION_SWEEP_TICKS * 50, TimeUnit.MILLISECONDS);
     }
 
     private void cleanupAndEvaluate() {
@@ -103,7 +113,9 @@ public class PacketAntibotManager {
         Long last = ipConnectionHistory.get(ip);
         if (last != null && now - last < throttle) {
                 pendingVerification.putIfAbsent(connId, new VerificationData());
-                Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                
+                // 👇 替换为 Folia 异步延迟
+                asyncScheduler.runDelayed(plugin, task -> {
                     try { Thread.sleep(250); } catch (InterruptedException ignored) {}
                     Long h = handshakeTimestamps.get(connId);
                     VerificationData d = pendingVerification.get(connId);
@@ -113,7 +125,8 @@ public class PacketAntibotManager {
                         try { controller.closeConnection(connId); } catch (Throwable ignored) {}
                         pendingVerification.remove(connId);
                     }
-                });
+                }, 250, TimeUnit.MILLISECONDS);
+                
                 return;
             }
         ipConnectionHistory.put(ip, now);
@@ -131,14 +144,16 @@ public class PacketAntibotManager {
     private void handleLoginStart(String connId, String username, long now) {
         Long handshake = handshakeTimestamps.get(connId);
         if (handshake == null) {
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            // 👇 替换为 Folia 异步延迟
+            asyncScheduler.runDelayed(plugin, task -> {
                 try { Thread.sleep(250); } catch (InterruptedException ignored) {}
                 Long h = handshakeTimestamps.get(connId);
                 if (h == null && !aggressiveMode.get()) {
                     plugin.getLogger().log(Level.INFO, "PacketAntibotManager: closing connection (missing-handshake after delay) conn={0}", new Object[]{connId});
                     try { controller.closeConnection(connId); } catch (Throwable ignored) {}
                 }
-            });
+            }, 250, TimeUnit.MILLISECONDS);
+            
             return;
         }
         long delta = now - handshake;
@@ -287,7 +302,6 @@ public class PacketAntibotManager {
             if (samples.size() >= 3) {
                 double variance = calculateVarianceFast(samples);
                 
-                // Advanced keepalive analysis with percentiles
                 double keepaliveScore = fingerprintAnalyzer.analyzeKeepaliveResponseTimes(samples);
                 data.botScores.keepaliveScore = keepaliveScore;
                 
@@ -346,10 +360,6 @@ public class PacketAntibotManager {
         }
     }
 
-    /**
-     * Fast variance calculation using Welford's online algorithm (single-pass).
-     * 2-3x faster than the traditional two-pass method.
-     */
     private double calculateVarianceFast(List<Long> samples) {
         if (samples.isEmpty()) return Double.MAX_VALUE;
         if (samples.size() == 1) return 0.0;
@@ -369,17 +379,12 @@ public class PacketAntibotManager {
         return count < 2 ? 0.0 : m2 / count;
     }
     
-    /**
-     * Extract /24 subnet from IP address.
-     */
     private String extractSubnet(String ip) {
         if (ip == null || ip.isEmpty()) return null;
         int lastDot = ip.lastIndexOf('.');
         if (lastDot == -1) return null;
         return ip.substring(0, lastDot) + ".0";
     }
-
-    
 
     private static class VerificationData {
         final long createdAt = System.currentTimeMillis();
